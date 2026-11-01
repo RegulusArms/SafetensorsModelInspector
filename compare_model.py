@@ -49,9 +49,20 @@ class _TensorFile:
     def supported(self, key: str) -> bool:
         return self.tensor_info[key]["dtype"] in NUMPY_DTYPES
 
-    def flat(self, key: str) -> np.ndarray:
+    def numel(self, key: str) -> int:
+        n = 1
+        for d in self.tensor_info[key]["shape"]:
+            n *= d
+        return n
+
+    def flat(self, key: str, first: int = 0, last: int | None = None) -> np.ndarray:
+        """Flat view of a tensor, optionally only elements [first, last)."""
         info = self.tensor_info[key]
         start, end = info["data_offsets"]
+        itemsize = np.dtype(NUMPY_DTYPES[info["dtype"]]).itemsize
+        if last is not None:
+            end = start + last * itemsize
+        start += first * itemsize
         raw = self.mm[self.data_start + start: self.data_start + end]
         arr = raw.view(NUMPY_DTYPES[info["dtype"]])
         if info["dtype"] == "BF16":
