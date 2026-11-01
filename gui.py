@@ -21,12 +21,13 @@ from PyQt6.QtWidgets import (
     QGridLayout, QSizePolicy, QProgressBar, QListWidget, QListWidgetItem,
     QAbstractItemView, QTextEdit, QComboBox, QCheckBox,
     QToolButton, QMenu, QWidgetAction, QDialog, QDialogButtonBox,
-    QTableWidgetSelectionRange, QGroupBox,
+    QTableWidgetSelectionRange, QGroupBox, QInputDialog, QProgressDialog, QMessageBox,
 )
 
 from inspect_model import (
     inspect_file, generate_modelinfo_dump,
 )
+from compare_model import compare_models, format_compare_report
 
 
 def _asset(name: str) -> str:
@@ -195,6 +196,79 @@ class AnalysisWorker(QThread):
             except Exception as e:
                 self.error_occurred.emit(fp, str(e))
         self.all_done.emit()
+
+
+class _CompareCancelled(Exception):
+    pass
+
+
+class CompareWorker(QThread):
+    """Runs compare_models() in a background thread."""
+    progress = pyqtSignal(int, int)    # done, total
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, tuned_path: str, base_path: str):
+        super().__init__()
+        self.tuned_path = tuned_path
+        self.base_path = base_path
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _on_progress(self, done, total):
+        if self._cancelled:
+            raise _CompareCancelled()
+        if done == total or done % 20 == 0:
+            self.progress.emit(done, total)
+
+    def run(self):
+        try:
+            result = compare_models(self.tuned_path, self.base_path, progress_cb=self._on_progress)
+            self.finished_ok.emit(result)
+        except _CompareCancelled:
+            pass
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class CompareDialog(QDialog):
+    """Shows a model comparison report with copy / save actions."""
+
+    def __init__(self, result: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Compare: {Path(result['tuned']).name} vs {Path(result['base']).name}")
+        self.resize(1100, 750)
+        self.report = format_compare_report(result)
+
+        layout = QVBoxLayout(self)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        text.setStyleSheet(
+            "QTextEdit { background-color: #11111b; color: #a6adc8; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; "
+            "border: 1px solid #313244; border-radius: 4px; padding: 8px; }"
+        )
+        text.setPlainText(self.report)
+        layout.addWidget(text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy_btn = buttons.addButton("Copy", QDialogButtonBox.ButtonRole.ActionRole)
+        save_btn = buttons.addButton("Save...", QDialogButtonBox.ButtonRole.ActionRole)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.report))
+        save_btn.clicked.connect(lambda: self._save(result))
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _save(self, result: dict):
+        default = str(Path(result["tuned"]).with_suffix(".compare.txt"))
+        path, _ = QFileDialog.getSaveFileName(self, "Save comparison report", default,
+                                              "Text files (*.txt);;All files (*)")
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.report)
 
 
 # ---------------------------------------------------------------------------
@@ -1182,6 +1256,15 @@ class MainWindow(QMainWindow):
         self.copy_paths_btn.clicked.connect(self._copy_selected_paths)
         bottom_actions.addWidget(self.copy_paths_btn)
 
+        self.compare_btn = QPushButton("Compare...")
+        self.compare_btn.setEnabled(False)
+        self.compare_btn.setToolTip(
+            "Diff a tuned model against its base model.\n"
+            "Select 2 models (you'll pick which is the base), or 1 model and browse for the base."
+        )
+        self.compare_btn.clicked.connect(self._compare_selected)
+        bottom_actions.addWidget(self.compare_btn)
+
         self.dump_btn = QPushButton("Dump .modelinfo")
         self.dump_btn.clicked.connect(self._dump_all)
         bottom_actions.addWidget(self.dump_btn)
@@ -1995,6 +2078,7 @@ class MainWindow(QMainWindow):
         self.move_files_btn.setEnabled(enabled)
         self.copy_names_btn.setEnabled(enabled)
         self.copy_paths_btn.setEnabled(enabled)
+        self.compare_btn.setEnabled(count in (1, 2))
 
         visible = set(self._visible_paths())
         if visible:
@@ -2051,6 +2135,55 @@ class MainWindow(QMainWindow):
             return
         text = "\n".join(sorted(self._selected_paths))
         QApplication.clipboard().setText(text)
+
+    def _compare_selected(self):
+        paths = sorted(self._selected_paths)
+        if len(paths) == 2:
+            names = [Path(p).name for p in paths]
+            choice, ok = QInputDialog.getItem(
+                self, "Compare models", "Which model is the BASE (original) model?", names, 0, False
+            )
+            if not ok:
+                return
+            base = paths[names.index(choice)]
+            tuned = paths[1 - names.index(choice)]
+        elif len(paths) == 1:
+            tuned = paths[0]
+            base, _ = QFileDialog.getOpenFileName(
+                self, f"Select the base model for {Path(tuned).name}",
+                str(Path(tuned).parent), "Safetensors (*.safetensors)"
+            )
+            if not base:
+                return
+        else:
+            return
+
+        progress = QProgressDialog("Comparing tensors...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Compare models")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        worker = CompareWorker(tuned, base)
+        self._compare_worker = worker
+
+        def on_progress(done, total):
+            progress.setMaximum(total)
+            progress.setValue(done)
+
+        def on_done(result):
+            progress.close()
+            CompareDialog(result, self).exec()
+
+        def on_failed(err):
+            progress.close()
+            QMessageBox.critical(self, "Compare failed", err)
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_failed)
+        progress.canceled.connect(worker.cancel)
+        worker.start()
 
     def _rebuild_views_from_results(self):
         current_results = list(self._results)

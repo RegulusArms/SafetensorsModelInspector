@@ -11,11 +11,13 @@ Inspect `.safetensors` models from a desktop GUI and CLI.
 - Extracts training metadata when present (steps, epochs, images, resolution, software, and related fields)
 - Supports file or folder workflows (including recursive folder scanning)
 - Supports `.modelinfo` key dumps for debugging and sharing
+- Compares a fine-tuned or merged model against its base model, showing how much each component changed
 
 ## Repository Layout
 
 - `gui.py`: GUI only
 - `inspect_model.py`: model parsing, detection logic, data extraction, CLI
+- `compare_model.py`: tuned-vs-base weight comparison, CLI
 - `requirements.txt`: dependencies
 - `venv_create.bat`: virtual environment bootstrap helper
 - `venv_activate.bat`: activate helper
@@ -84,6 +86,28 @@ py inspect_model.py path\to\folder --recursive --dump-keys
 ```bat
 py inspect_model.py path\to\folder --recursive --allow-filename-alias-detection
 ```
+
+### Compare a tuned model against its base model
+
+```bat
+py compare_model.py path\to\my-finetune.safetensors path\to\base-model.safetensors
+py compare_model.py path\to\my-finetune.safetensors path\to\base-model.safetensors --json
+```
+
+The two models must share the same architecture. Tensors are read one at a time via memory mapping, so this
+works on large checkpoints without loading them into RAM. The report shows:
+
+- Per-component relative change (`||tuned - base|| / ||base||`) and cosine similarity, broken down by
+  UNet block, text encoder, and VAE, with a verdict (`unchanged`, `changed`, `partially changed`,
+  `rescaled copy`, `different variant`, `replaced / heavily changed`)
+- Keys added or removed, shape mismatches, and dtype changes (for example a VAE upcast from FP16 to FP32)
+- Tensors containing NaN/Inf values in either model
+- Rescaled tensors (same direction, very different magnitude), which usually mean a different VAE variant
+  (such as the fp16-fix VAE) was swapped in rather than trained
+- The most-changed individual tensors
+
+In the GUI, select two models and click `Compare...` (you will be asked which one is the base), or select
+one model and pick the base file in the browse dialog.
 
 ## GUI Walkthrough
 
