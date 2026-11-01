@@ -11,11 +11,15 @@ Inspect `.safetensors` models from a desktop GUI and CLI.
 - Extracts training metadata when present (steps, epochs, images, resolution, software, and related fields)
 - Supports file or folder workflows (including recursive folder scanning)
 - Supports `.modelinfo` key dumps for debugging and sharing
+- Compares a fine-tuned or merged model against its base model, showing how much each component changed
+- Reverse engineers merges: works out which models (and ratios) were merged to create a model, including nested merges
 
 ## Repository Layout
 
 - `gui.py`: GUI only
 - `inspect_model.py`: model parsing, detection logic, data extraction, CLI
+- `compare_model.py`: tuned-vs-base weight comparison, CLI
+- `reverse_merge.py`: merge reverse engineering (recipe metadata + weight fitting), CLI
 - `requirements.txt`: dependencies
 - `venv_create.bat`: virtual environment bootstrap helper
 - `venv_activate.bat`: activate helper
@@ -84,6 +88,66 @@ py inspect_model.py path\to\folder --recursive --dump-keys
 ```bat
 py inspect_model.py path\to\folder --recursive --allow-filename-alias-detection
 ```
+
+### Compare a tuned model against its base model
+
+```bat
+py compare_model.py path\to\my-finetune.safetensors path\to\base-model.safetensors
+py compare_model.py path\to\my-finetune.safetensors path\to\base-model.safetensors --json
+```
+
+The two models must share the same architecture. Tensors are read one at a time via memory mapping, so this
+works on large checkpoints without loading them into RAM. The report shows:
+
+- Per-component relative change (`||tuned - base|| / ||base||`) and cosine similarity, broken down by
+  UNet block, text encoder, and VAE, with a verdict (`unchanged`, `changed`, `partially changed`,
+  `rescaled copy`, `different variant`, `replaced / heavily changed`)
+- Keys added or removed, shape mismatches, and dtype changes (for example a VAE upcast from FP16 to FP32)
+- Tensors containing NaN/Inf values in either model
+- Rescaled tensors (same direction, very different magnitude), which usually mean a different VAE variant
+  (such as the fp16-fix VAE) was swapped in rather than trained
+- The most-changed individual tensors
+
+In the GUI, select two models and click `Compare...` (you will be asked which one is the base), or select
+one model and pick the base file in the browse dialog.
+
+### Reverse engineer a merged model
+
+```bat
+py reverse_merge.py path\to\merged.safetensors
+py reverse_merge.py path\to\merged.safetensors path\to\candidates_folder
+py reverse_merge.py path\to\merged.safetensors path\to\a.safetensors path\to\b.safetensors --json
+```
+
+Two independent kinds of evidence are reported:
+
+1. **Merge recipe metadata.** The A1111 / Forge checkpoint merger stores the full merge history in the file
+   (`sd_merge_recipe` + `sd_merge_models`). This is rebuilt into a nested tree with formulas (weighted sum,
+   add difference, baked VAE) and flattened into each original model's net contribution. This needs no other
+   files. If candidate models are given, recorded ingredients are matched to them (by A1111 hash or name)
+   and missing ones are listed.
+2. **Weight analysis** (needs candidate models). The target's weights are fitted as a linear combination of
+   the candidates, on slices sampled from every tensor, separately for the UNet, each text encoder and the
+   VAE. It detects:
+   - weighted sums and add-difference merges (negative weights), with their ratios
+   - block-weighted (MBW) merges, with a per-block weight table
+   - nested merges: candidates that are themselves merges of other candidates, such as
+     `(a+b)+(c+d)` when `a+b` and `c+d` are available
+   - targets that aren't merges of the candidates at all (for example fine-tunes), with their closest relative
+
+Limitations:
+
+- Only models in the candidate pool can be identified. Ingredients you no longer have show up as
+  unexplained changes.
+- Nested weighted sums flatten into a single linear mix, so `(a+b)+(c+d)` at 0.5 is mathematically identical to a
+  flat 0.25 each merge. Without the intermediate models, the report ranks possible merge orders by how round
+  their ratios are. This is a best guess.
+- Weights can't show merge direction. Candidates whose recorded recipe contains the target are excluded, and
+  sources with newer files than the target are flagged as possibly derived from it.
+- Non-linear merges (TIES, DARE, SLERP between distant models) fit only approximately.
+
+In the GUI, select one model and click `Reverse Engineer...`. All other loaded models are used as candidates,
+so load the suspected ingredients (or the whole folder) first.
 
 ## GUI Walkthrough
 

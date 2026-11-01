@@ -21,12 +21,14 @@ from PyQt6.QtWidgets import (
     QGridLayout, QSizePolicy, QProgressBar, QListWidget, QListWidgetItem,
     QAbstractItemView, QTextEdit, QComboBox, QCheckBox,
     QToolButton, QMenu, QWidgetAction, QDialog, QDialogButtonBox,
-    QTableWidgetSelectionRange, QGroupBox,
+    QTableWidgetSelectionRange, QGroupBox, QInputDialog, QProgressDialog, QMessageBox,
 )
 
 from inspect_model import (
     inspect_file, generate_modelinfo_dump,
 )
+from compare_model import compare_models, format_compare_report
+from reverse_merge import reverse_engineer, format_reverse_report
 
 
 def _asset(name: str) -> str:
@@ -195,6 +197,82 @@ class AnalysisWorker(QThread):
             except Exception as e:
                 self.error_occurred.emit(fp, str(e))
         self.all_done.emit()
+
+
+class _TaskCancelled(Exception):
+    pass
+
+
+class ReportWorker(QThread):
+    """Runs a long analysis function (compare / reverse engineer) in a background thread.
+
+    The function is called as fn(*args, progress_cb=...) and must return a result dict.
+    progress_cb(done, total[, message]) may pass a message describing the current step.
+    """
+    progress = pyqtSignal(int, int, str)    # done, total, message
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn, *args):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _on_progress(self, done, total, message=""):
+        if self._cancelled:
+            raise _TaskCancelled()
+        if message or done == total or done % 20 == 0:
+            self.progress.emit(done, total, message)
+
+    def run(self):
+        try:
+            self.finished_ok.emit(self.fn(*self.args, progress_cb=self._on_progress))
+        except _TaskCancelled:
+            pass
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class ReportDialog(QDialog):
+    """Shows a text report with copy / save actions."""
+
+    def __init__(self, title: str, report: str, default_save_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1100, 750)
+        self.report = report
+        self.default_save_path = default_save_path
+
+        layout = QVBoxLayout(self)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        text.setStyleSheet(
+            "QTextEdit { background-color: #11111b; color: #a6adc8; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; "
+            "border: 1px solid #313244; border-radius: 4px; padding: 8px; }"
+        )
+        text.setPlainText(self.report)
+        layout.addWidget(text)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy_btn = buttons.addButton("Copy", QDialogButtonBox.ButtonRole.ActionRole)
+        save_btn = buttons.addButton("Save...", QDialogButtonBox.ButtonRole.ActionRole)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.report))
+        save_btn.clicked.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _save(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save report", self.default_save_path,
+                                              "Text files (*.txt);;All files (*)")
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.report)
 
 
 # ---------------------------------------------------------------------------
@@ -861,7 +939,9 @@ class MainWindow(QMainWindow):
         self._top_folded = False
         self._auto_fold_on_analyze = False
         self._auto_analyze_on_add = True
-        self._add_mode = "replace"  # replace | additive
+        self._add_mode = "additive"  # replace | additive
+        self._analyzed_paths: set[str] = set()  # paths with a result or error card
+        self._analysis_requested = False  # files were added while a worker was running
         self._default_tab = "simple"  # simple | detailed | data | raw
         self._card_field_visibility = {
             "parameters": True,
@@ -1182,6 +1262,25 @@ class MainWindow(QMainWindow):
         self.copy_paths_btn.clicked.connect(self._copy_selected_paths)
         bottom_actions.addWidget(self.copy_paths_btn)
 
+        self.compare_btn = QPushButton("Compare...")
+        self.compare_btn.setEnabled(False)
+        self.compare_btn.setToolTip(
+            "Diff a tuned model against its base model.\n"
+            "Select 2 models (you'll pick which is the base), or 1 model and browse for the base."
+        )
+        self.compare_btn.clicked.connect(self._compare_selected)
+        bottom_actions.addWidget(self.compare_btn)
+
+        self.reverse_btn = QPushButton("Reverse Engineer...")
+        self.reverse_btn.setEnabled(False)
+        self.reverse_btn.setToolTip(
+            "Work out which models were merged to create the selected model.\n"
+            "Reads any merge recipe stored in the file, and fits the weights against all other\n"
+            "loaded models (load the suspected ingredients too for best results)."
+        )
+        self.reverse_btn.clicked.connect(self._reverse_engineer_selected)
+        bottom_actions.addWidget(self.reverse_btn)
+
         self.dump_btn = QPushButton("Dump .modelinfo")
         self.dump_btn.clicked.connect(self._dump_all)
         bottom_actions.addWidget(self.dump_btn)
@@ -1238,10 +1337,10 @@ class MainWindow(QMainWindow):
         self._allow_filename_alias_detection = str(s.value("allow_filename_alias_detection", "false")).lower() == "true"
         self._auto_fold_on_analyze = str(s.value("auto_fold_on_analyze", "false")).lower() == "true"
         self._auto_analyze_on_add = str(s.value("auto_analyze_on_add", "true")).lower() == "true"
-        self._add_mode = str(s.value("add_mode", "replace")).lower()
+        self._add_mode = str(s.value("add_mode", "additive")).lower()
         self._default_tab = str(s.value("default_tab", "simple")).lower()
         if self._add_mode not in ("replace", "additive"):
-            self._add_mode = "replace"
+            self._add_mode = "additive"
         if self._default_tab not in ("simple", "detailed", "data", "raw"):
             self._default_tab = "simple"
         raw_detailed = s.value("detailed_card_fields", "")
@@ -1299,8 +1398,7 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         if self._add_mode == "replace":
-            self._queued_files.clear()
-            self.file_list.clear()
+            self._clear_all()
 
         for p in paths:
             if p not in self._queued_files:
@@ -1311,7 +1409,7 @@ class MainWindow(QMainWindow):
                 self.file_list.addItem(item)
         self._update_file_count()
         if self._auto_analyze_on_add:
-            self._analyze_all()
+            self._analyze_pending()
 
     def _remove_selected_files(self):
         for item in self.file_list.selectedItems():
@@ -1390,6 +1488,7 @@ class MainWindow(QMainWindow):
     def _clear_all(self):
         self._queued_files.clear()
         self._results.clear()
+        self._analyzed_paths.clear()
         self._cards.clear()
         self._path_to_card.clear()
         self._path_to_simple_card.clear()
@@ -1407,36 +1506,52 @@ class MainWindow(QMainWindow):
 
     # -- Analysis ----------------------------------------------------------
 
+    def _pending_files(self) -> list[str]:
+        return [p for p in self._queued_files if p not in self._analyzed_paths]
+
     def _analyze_all(self):
-        if not self._queued_files:
+        """Analyze button: analyze newly added files, or re-analyze everything if none are new."""
+        if self._pending_files():
+            self._analyze_pending()
+        else:
+            self._start_analysis(list(self._queued_files), reset=True)
+
+    def _analyze_pending(self):
+        """Analyze only files that don't have a card yet, keeping existing results on screen."""
+        self._start_analysis(self._pending_files(), reset=False)
+
+    def _start_analysis(self, filepaths: list[str], reset: bool):
+        if not filepaths:
             return
         if self._worker and self._worker.isRunning():
+            self._analysis_requested = True
             return
         if self._auto_fold_on_analyze and not self._top_folded:
             self._toggle_top_fold()
 
         self.analyze_btn.setEnabled(False)
         self.progress.setVisible(True)
-        self.progress.setMaximum(len(self._queued_files))
+        self.progress.setMaximum(len(filepaths))
         self.progress.setValue(0)
 
-        # Clear previous results
-        self._results.clear()
-        self._cards.clear()
-        self._path_to_card.clear()
-        self._path_to_simple_card.clear()
-        self._path_to_row.clear()
-        self._selected_paths.clear()
-        self._active_arch_filter.clear()
-        self._clear_cards()
-        self.arch_filter_btn.clear_architectures()
-        self.table.setRowCount(0)
-        self.raw_combo.clear()
-        self.raw_text.clear()
-        self._update_selection_ui_state()
+        if reset:
+            self._results.clear()
+            self._analyzed_paths.clear()
+            self._cards.clear()
+            self._path_to_card.clear()
+            self._path_to_simple_card.clear()
+            self._path_to_row.clear()
+            self._selected_paths.clear()
+            self._active_arch_filter.clear()
+            self._clear_cards()
+            self.arch_filter_btn.clear_architectures()
+            self.table.setRowCount(0)
+            self.raw_combo.clear()
+            self.raw_text.clear()
+            self._update_selection_ui_state()
 
         self._worker = AnalysisWorker(
-            list(self._queued_files),
+            filepaths,
             inspect_options={
                 "allow_filename_alias_detection": self._allow_filename_alias_detection
             },
@@ -1447,8 +1562,12 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def _on_result(self, data: dict):
+        fp = data.get("filepath")
+        if fp not in self._queued_files:  # list was cleared/replaced while this ran
+            return
+        self._analyzed_paths.add(fp)
         self._results.append(data)
-        self.progress.setValue(len(self._results))
+        self.progress.setValue(self.progress.value() + 1)
         self._add_card(data)
         self._add_table_row(data)
         self.arch_filter_btn.add_architecture(data.get("architecture", "Unknown"))
@@ -1456,6 +1575,9 @@ class MainWindow(QMainWindow):
         self._refresh_raw_combo_filtered()
 
     def _on_error(self, filepath: str, error: str):
+        if filepath not in self._queued_files:
+            return
+        self._analyzed_paths.add(filepath)
         self.progress.setValue(self.progress.value() + 1)
         # Add an error card
         err_data = {
@@ -1485,6 +1607,9 @@ class MainWindow(QMainWindow):
     def _on_all_done(self):
         self.analyze_btn.setEnabled(True)
         self.progress.setVisible(False)
+        if self._analysis_requested:
+            self._analysis_requested = False
+            QTimer.singleShot(0, self._analyze_pending)
 
     def _dump_all(self):
         """Write a .modelinfo file next to every analyzed model."""
@@ -1995,6 +2120,8 @@ class MainWindow(QMainWindow):
         self.move_files_btn.setEnabled(enabled)
         self.copy_names_btn.setEnabled(enabled)
         self.copy_paths_btn.setEnabled(enabled)
+        self.compare_btn.setEnabled(count in (1, 2))
+        self.reverse_btn.setEnabled(count == 1)
 
         visible = set(self._visible_paths())
         if visible:
@@ -2037,6 +2164,7 @@ class MainWindow(QMainWindow):
         if moved:
             self._queued_files = [p for p in self._queued_files if p not in moved]
             self._results = [r for r in self._results if r.get("filepath") not in moved]
+            self._analyzed_paths -= moved
             self._selected_paths -= moved
             self._rebuild_views_from_results()
 
@@ -2051,6 +2179,86 @@ class MainWindow(QMainWindow):
             return
         text = "\n".join(sorted(self._selected_paths))
         QApplication.clipboard().setText(text)
+
+    def _compare_selected(self):
+        paths = sorted(self._selected_paths)
+        if len(paths) == 2:
+            names = [Path(p).name for p in paths]
+            choice, ok = QInputDialog.getItem(
+                self, "Compare models", "Which model is the BASE (original) model?", names, 0, False
+            )
+            if not ok:
+                return
+            base = paths[names.index(choice)]
+            tuned = paths[1 - names.index(choice)]
+        elif len(paths) == 1:
+            tuned = paths[0]
+            base, _ = QFileDialog.getOpenFileName(
+                self, f"Select the base model for {Path(tuned).name}",
+                str(Path(tuned).parent), "Safetensors (*.safetensors)"
+            )
+            if not base:
+                return
+        else:
+            return
+
+        self._run_report_task(
+            "Compare models", "Comparing tensors...", compare_models, (tuned, base),
+            lambda r: (f"Compare: {Path(r['tuned']).name} vs {Path(r['base']).name}",
+                       format_compare_report(r),
+                       str(Path(r["tuned"]).with_suffix(".compare.txt"))),
+        )
+
+    def _reverse_engineer_selected(self):
+        if len(self._selected_paths) != 1:
+            return
+        target = next(iter(self._selected_paths))
+        candidates = [p for p in self._queued_files if p != target]
+        if not candidates:
+            candidates, _ = QFileDialog.getOpenFileNames(
+                self, f"Select candidate source models for {Path(target).name} (cancel = recipe metadata only)",
+                str(Path(target).parent), "Safetensors (*.safetensors)"
+            )
+        self._run_report_task(
+            "Reverse engineer merge", "Sampling tensors...", reverse_engineer, (target, candidates),
+            lambda r: (f"Reverse engineer: {Path(r['target']).name}",
+                       format_reverse_report(r),
+                       str(Path(r["target"]).with_suffix(".merge-analysis.txt"))),
+        )
+
+    def _run_report_task(self, title: str, label: str, fn, args: tuple, present):
+        """Run fn in a ReportWorker with a progress dialog; present(result) -> (title, text, save path)."""
+        progress = QProgressDialog(label, "Cancel", 0, 100, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        # Stay open at 100%: the task may still be working after its last progress step
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumWidth(560)
+        progress.setValue(0)
+
+        worker = ReportWorker(fn, *args)
+        self._report_worker = worker
+
+        def on_progress(done, total, message):
+            progress.setMaximum(total)
+            progress.setValue(done)
+            progress.setLabelText(message or f"{label} {done:,} / {total:,}")
+
+        def on_done(result):
+            progress.close()
+            ReportDialog(*present(result), parent=self).exec()
+
+        def on_failed(err):
+            progress.close()
+            QMessageBox.critical(self, f"{title} failed", err)
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_failed)
+        progress.canceled.connect(worker.cancel)
+        worker.start()
 
     def _rebuild_views_from_results(self):
         current_results = list(self._results)
